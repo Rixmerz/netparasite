@@ -16,8 +16,8 @@ connection always rides one link. So netparasite works at two levels:
 
 ## Requirements
 
-- Linux 5.7 or newer (unprivileged `SO_BINDTODEVICE`)
-- Python 3.9+, no extra packages
+- `multidl`: Linux 5.7+ or Windows 10+, Python 3.9+, no extra packages
+- System-wide route: Linux only
 - NetworkManager, for the system-wide route
 - `adb` (android-tools), optional, to switch on USB tethering automatically
 
@@ -44,6 +44,18 @@ What it does by itself:
   `~/.local/state/multidl/state.json`; `--forget` starts from scratch.
 
 The server must support HTTP range requests.
+
+### Windows
+
+```powershell
+python multidl https://example.com/big.iso
+```
+
+Links come from `Get-NetRoute` (every interface with a default route), and each
+connection is bound to its interface's IPv4 address. Android tethering through
+adb works the same way if `adb.exe` is on the PATH. State lives in
+`%LOCALAPPDATA%\multidl\state.json`. There is no system-wide route on Windows;
+apps such as Speedify or Connectify Dispatch cover that.
 
 ## System-wide multipath route
 

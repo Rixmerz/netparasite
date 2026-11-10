@@ -12,7 +12,8 @@ Design, aimed at using every link at full capacity:
   example a phone tethering the Wi-Fi this machine is already on); only
   one of them is kept.
 - Each worker keeps one persistent HTTP(S) connection bound to its
-  interface (SO_BINDTODEVICE, unprivileged since Linux 5.7).
+  interface (Linux: SO_BINDTODEVICE, unprivileged since 5.7; Windows: bound to the
+  interface address).
 - Chunks are sized per worker from its measured rate (~3 s of work), so a
   fast link takes big bites and a slow link small ones.
 - Work stealing: once nothing is left to hand out, an idle worker takes
@@ -53,9 +54,12 @@ GROW_INTERVAL = 2.0
 GROW_GAIN = 1.15
 IP_ECHO_URL = "https://api.ipify.org/"
 START_CONNS = 2
-STATE_PATH = os.path.join(
-    os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")),
-    "multidl", "state.json")
+WINDOWS = os.name == "nt"
+if WINDOWS:
+    _state_root = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
+else:
+    _state_root = os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state"))
+STATE_PATH = os.path.join(_state_root, "multidl", "state.json")
 LIMIT_TTL = 7 * 24 * 3600  # re-test a learned server limit after a week
 
 threads_guard = threading.Lock()  # protects Job.conns and the thread list
@@ -68,8 +72,43 @@ def log(msg):
     print(msg, file=sys.stderr)
 
 
+# Windows only: alias -> {"ip", "gw", "usb"}, refreshed by default_ifaces().
+WIN_LINKS = {}
+
+_WIN_QUERY = r"""
+$ErrorActionPreference = 'SilentlyContinue'
+Get-NetRoute -AddressFamily IPv4 -DestinationPrefix 0.0.0.0/0 |
+  Sort-Object RouteMetric | ForEach-Object {
+    $ip = (Get-NetIPAddress -AddressFamily IPv4 -InterfaceIndex $_.ifIndex |
+           Select-Object -First 1).IPAddress
+    $pnp = (Get-NetAdapter -InterfaceIndex $_.ifIndex).PnPDeviceID
+    if ($ip) { "$($_.InterfaceAlias)`t$ip`t$($_.NextHop)`t$pnp" }
+  }
+"""
+
+
+def _windows_links():
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", _WIN_QUERY],
+            capture_output=True, text=True, timeout=30).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        out = ""
+    links = {}
+    for line in out.splitlines():
+        parts = line.rstrip("\r").split("\t")
+        if len(parts) >= 3 and parts[0] not in links:
+            links[parts[0]] = {"ip": parts[1], "gw": parts[2],
+                               "usb": len(parts) > 3 and parts[3].upper().startswith("USB")}
+    WIN_LINKS.clear()
+    WIN_LINKS.update(links)
+    return list(links)
+
+
 def default_ifaces():
     """Every interface that currently holds a default route."""
+    if WINDOWS:
+        return _windows_links()
     out = subprocess.run(["ip", "route", "show", "default"],
                          capture_output=True, text=True).stdout
     ifaces = []
@@ -85,6 +124,8 @@ def default_ifaces():
 def link_keys(ifaces):
     """Stable-enough identity of each link: interface plus its gateway, so
     the same Wi-Fi card on another network counts as another link."""
+    if WINDOWS:
+        return {i: f"{i}@{WIN_LINKS.get(i, {}).get('gw', '-')}" for i in ifaces}
     out = subprocess.run(["ip", "route", "show", "default"],
                          capture_output=True, text=True).stdout
     gw = {}
@@ -116,6 +157,8 @@ def save_state(state):
 
 
 def is_usb(iface):
+    if WINDOWS:
+        return WIN_LINKS.get(iface, {}).get("usb", False)
     path = os.path.realpath(f"/sys/class/net/{iface}/device/subsystem")
     return os.path.basename(path) == "usb"
 
@@ -175,7 +218,12 @@ def make_conn(url, iface, timeout=30):
 
     def connect(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, iface.encode())
+        if WINDOWS:
+            # Windows sends with the strong host model: a socket bound to an
+            # interface's address leaves through that interface's route.
+            sock.bind((WIN_LINKS[iface]["ip"], 0))
+        else:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, iface.encode())
         sock.settimeout(timeout)
         sock.connect((resolve_ip(self.host), self.port))
         if isinstance(self, http.client.HTTPSConnection):
@@ -335,6 +383,21 @@ class Job:
             self.stats[iface] += n
 
 
+_write_lock = threading.Lock()
+
+
+def write_at(fd, data, offset):
+    if hasattr(os, "pwrite"):
+        os.pwrite(fd, data, offset)
+        return
+    # Windows has no pwrite: serialize seek + write.
+    with _write_lock:
+        os.lseek(fd, offset, os.SEEK_SET)
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
+
+
 def worker(job, iface, fd):
     u = urllib.parse.urlsplit(job.url)
     path = (u.path or "/") + (f"?{u.query}" if u.query else "")
@@ -399,7 +462,7 @@ def worker(job, iface, fd):
                     break
                 with rg.lock:
                     keep = min(len(data), rg.end - rg.start + 1)
-                    os.pwrite(fd, data[:keep], rg.start)
+                    write_at(fd, data[:keep], rg.start)
                     rg.start += keep
                 got += len(data)
                 job.count(iface, len(data))
@@ -475,7 +538,7 @@ def main():
         sys.exit("error: server does not accept byte ranges; use plain curl")
     out_path = args.output or os.path.basename(urllib.parse.urlsplit(url).path) or "download.bin"
 
-    fd = os.open(out_path, os.O_RDWR | os.O_CREAT, 0o644)
+    fd = os.open(out_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o644)
     os.ftruncate(fd, size)
     job = Job(url, size, ifaces, budget)
 
