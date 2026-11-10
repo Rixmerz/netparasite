@@ -1,0 +1,589 @@
+#!/usr/bin/env python3
+"""Download one file over every internet link this machine has, at once.
+
+Design, aimed at using every link at full capacity:
+
+- Link discovery: every interface with a default route is a link. Android
+  devices on USB with debugging authorized get USB tethering switched on
+  through adb first, so plugging a phone in is enough. Any other machine
+  that shares its internet over a cable (Ethernet, USB-Ethernet,
+  Thunderbolt) shows up as a link the same way, with no extra setup here.
+- Links that leave through the same public IP are the same uplink (for
+  example a phone tethering the Wi-Fi this machine is already on); only
+  one of them is kept.
+- Each worker keeps one persistent HTTP(S) connection bound to its
+  interface (SO_BINDTODEVICE, unprivileged since Linux 5.7).
+- Chunks are sized per worker from its measured rate (~3 s of work), so a
+  fast link takes big bites and a slow link small ones.
+- Work stealing: once nothing is left to hand out, an idle worker takes
+  the upper half of the largest unfinished range. A slow link can never
+  hold the tail of the download hostage.
+- Connections per link grow while they keep paying off: a link starts
+  with one and gets another every 2 s as long as its throughput rose by
+  more than 15 %.
+- Optional data cap per link (--cap), for metered mobile plans.
+- Self-tuning memory: after each run the tool stores, per server and per
+  link, how many connections paid off, the limit at which the server
+  started refusing requests, and the rate per connection. The next run
+  starts from those values instead of probing from scratch. A learned
+  server limit expires after a week so it gets re-tested.
+
+Usage: multidl URL [-o FILE] [-i IFACE ...] [-j MAX_CONNS] [--cap LINK=MB]
+"""
+import argparse
+import http.client
+import json
+import os
+import shutil
+import socket
+import ssl
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+
+BLOCK = 64 * 1024
+UA = "multidl/1.2"  # some servers drop requests that carry no user agent
+MIN_CHUNK = 256 * 1024
+MAX_CHUNK = 32 * 1024 * 1024
+TARGET_SECONDS = 3.0
+STEAL_MIN = 2 * 1024 * 1024  # do not steal ranges smaller than this
+GROW_INTERVAL = 2.0
+GROW_GAIN = 1.15
+IP_ECHO_URL = "https://api.ipify.org/"
+START_CONNS = 2
+STATE_PATH = os.path.join(
+    os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")),
+    "multidl", "state.json")
+LIMIT_TTL = 7 * 24 * 3600  # re-test a learned server limit after a week
+
+threads_guard = threading.Lock()  # protects Job.conns and the thread list
+
+WAIT = object()    # nothing to take right now, but the job is not finished
+CAPPED = object()  # this link used up its data cap
+
+
+def log(msg):
+    print(msg, file=sys.stderr)
+
+
+def default_ifaces():
+    """Every interface that currently holds a default route."""
+    out = subprocess.run(["ip", "route", "show", "default"],
+                         capture_output=True, text=True).stdout
+    ifaces = []
+    for line in out.splitlines():
+        parts = line.split()
+        if "dev" in parts:
+            dev = parts[parts.index("dev") + 1]
+            if dev not in ifaces:
+                ifaces.append(dev)
+    return ifaces
+
+
+def link_keys(ifaces):
+    """Stable-enough identity of each link: interface plus its gateway, so
+    the same Wi-Fi card on another network counts as another link."""
+    out = subprocess.run(["ip", "route", "show", "default"],
+                         capture_output=True, text=True).stdout
+    gw = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if "dev" in parts and "via" in parts:
+            gw.setdefault(parts[parts.index("dev") + 1], parts[parts.index("via") + 1])
+    return {i: f"{i}@{gw.get(i, '-')}" for i in ifaces}
+
+
+def load_state():
+    try:
+        with open(STATE_PATH) as f:
+            state = json.load(f)
+        return state if isinstance(state.get("hosts"), dict) else {"hosts": {}}
+    except (OSError, ValueError, AttributeError):
+        return {"hosts": {}}
+
+
+def save_state(state):
+    try:
+        os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+        tmp = STATE_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f, indent=1)
+        os.replace(tmp, STATE_PATH)
+    except OSError as e:
+        log(f"could not save tuning state: {e}")
+
+
+def is_usb(iface):
+    path = os.path.realpath(f"/sys/class/net/{iface}/device/subsystem")
+    return os.path.basename(path) == "usb"
+
+
+def adb(*args, timeout=10):
+    try:
+        return subprocess.run(["adb", *args], capture_output=True, text=True,
+                              timeout=timeout).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def tether_android_devices():
+    """Turn on USB tethering on every authorized Android device."""
+    if not shutil.which("adb"):
+        return
+    before = len(default_ifaces())
+    switched = 0
+    for line in adb("devices").splitlines()[1:]:
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        serial, state = parts[0], parts[1]
+        if state == "unauthorized":
+            log(f"android {serial}: accept the USB debugging prompt on the device to use it")
+            continue
+        if state != "device":
+            continue
+        usb_state = adb("-s", serial, "shell", "getprop", "sys.usb.state")
+        if "rndis" in usb_state or "ncm" in usb_state:
+            continue
+        log(f"android {serial}: enabling USB tethering")
+        adb("-s", serial, "shell", "svc", "usb", "setFunctions", "rndis")
+        switched += 1
+    # The new interface needs a moment to appear and get a DHCP lease.
+    deadline = time.time() + 15
+    while switched and time.time() < deadline:
+        if len(default_ifaces()) >= before + switched:
+            break
+        time.sleep(0.5)
+
+
+_ip_cache = {}
+LATENCY = {}  # iface -> seconds, filled by the uplink probe
+
+
+def resolve_ip(host):
+    """Resolve once per run: DNS on every reconnect costs seconds."""
+    if host not in _ip_cache:
+        _ip_cache[host] = socket.getaddrinfo(host, None, socket.AF_INET)[0][4][0]
+    return _ip_cache[host]
+
+
+def make_conn(url, iface, timeout=30):
+    u = urllib.parse.urlsplit(url)
+    port = u.port or (443 if u.scheme == "https" else 80)
+
+    def connect(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, iface.encode())
+        sock.settimeout(timeout)
+        sock.connect((resolve_ip(self.host), self.port))
+        if isinstance(self, http.client.HTTPSConnection):
+            sock = self._context.wrap_socket(sock, server_hostname=self.host)
+        self.sock = sock
+
+    if u.scheme == "https":
+        cls = type("BoundHTTPS", (http.client.HTTPSConnection,), {"connect": connect})
+        return cls(u.hostname, port, context=ssl.create_default_context())
+    cls = type("BoundHTTP", (http.client.HTTPConnection,), {"connect": connect})
+    return cls(u.hostname, port)
+
+
+def public_ips(ifaces):
+    """(public IP, round-trip seconds) seen through each interface; the IP
+    is None when the interface has no internet."""
+    result = {}
+
+    def probe(iface):
+        try:
+            c = make_conn(IP_ECHO_URL, iface, timeout=5)
+            c.connect()
+            t0 = time.time()
+            c.request("GET", "/", headers={"User-Agent": UA})
+            ip = c.getresponse().read().decode().strip()
+            result[iface] = (ip, time.time() - t0)
+            c.close()
+        except (OSError, http.client.HTTPException):
+            result[iface] = (None, None)
+
+    threads = [threading.Thread(target=probe, args=(i,), daemon=True) for i in ifaces]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(8)
+    return result
+
+
+def distinct_uplinks(ifaces):
+    """Drop dead links and links that share a public IP with an earlier one.
+    The survivors come back ordered by latency, lowest first."""
+    probes = public_ips(ifaces)
+    seen = {}
+    keep = []
+    for iface in sorted(ifaces, key=lambda i: probes.get(i, (None, None))[1] or 99):
+        ip, rtt = probes.get(iface, (None, None))
+        if ip:
+            LATENCY[iface] = rtt
+        if not ip:
+            log(f"{iface}: no internet, skipped")
+        elif ip in seen:
+            log(f"{iface}: same uplink as {seen[ip]} ({ip}), skipped")
+        else:
+            seen[ip] = iface
+            keep.append(iface)
+    return keep
+
+
+def resolve(url, iface, hops=5):
+    """Follow redirects; return (final_url, size, accepts_ranges)."""
+    for _ in range(hops):
+        u = urllib.parse.urlsplit(url)
+        c = make_conn(url, iface)
+        path = (u.path or "/") + (f"?{u.query}" if u.query else "")
+        c.request("GET", path, headers={"Range": "bytes=0-0", "User-Agent": UA})
+        r = c.getresponse()
+        r.read()
+        c.close()
+        if r.status in (301, 302, 303, 307, 308):
+            url = urllib.parse.urljoin(url, r.getheader("Location"))
+            continue
+        if r.status == 206:
+            cr = r.getheader("Content-Range", "")  # bytes 0-0/12345
+            return url, int(cr.rsplit("/", 1)[1]), True
+        return url, int(r.getheader("Content-Length") or 0), False
+    sys.exit("error: too many redirects")
+
+
+class Range:
+    def __init__(self, start, end):
+        self.start = start      # next byte still to write
+        self.end = end          # inclusive; may shrink when stolen from
+        self.lock = threading.Lock()
+
+
+class Job:
+    def __init__(self, url, size, ifaces, budget):
+        self.url = url
+        self.size = size
+        self.cursor = 0
+        self.active = []
+        self.orphans = []
+        self.lock = threading.Lock()
+        self.stats_lock = threading.Lock()
+        self.stats = {i: 0 for i in ifaces}
+        self.conns = {i: 0 for i in ifaces}
+        self.budget = budget    # iface -> bytes it may still take
+        self.errors = {}
+        self.dead = set()
+        self.capped = set()
+        self.throttled = False  # the server answered 429/503 at least once
+        self.limit = {}      # iface -> connections the server tolerated
+        self.last_retire = {}
+        self.best = {}       # iface -> connections that proved worth having
+        self.seed_rate = {}  # iface -> bytes/s per connection from past runs
+        self.finished = threading.Event()
+
+    def take(self, iface, want):
+        with self.lock:
+            budget = self.budget.get(iface)
+            if budget is not None and budget <= 0:
+                return CAPPED
+            if self.orphans:
+                rg = self.orphans.pop()
+            elif self.cursor < self.size:
+                end = min(self.cursor + want, self.size) - 1
+                rg = Range(self.cursor, end)
+                self.cursor = end + 1
+            else:
+                # Nothing left to hand out: steal half of the largest open range.
+                best = max(self.active, key=lambda r: r.end - r.start, default=None)
+                if not best:
+                    return None  # job complete
+                with best.lock:
+                    left = best.end - best.start + 1
+                    if left < STEAL_MIN:
+                        return WAIT
+                    mid = best.start + left // 2
+                    rg = Range(mid, best.end)
+                    best.end = mid - 1
+            if budget is not None:
+                length = rg.end - rg.start + 1
+                if length > budget:
+                    # Keep only what the cap allows; the rest goes back.
+                    self.orphans.append(Range(rg.start + budget, rg.end))
+                    rg.end = rg.start + budget - 1
+                    length = budget
+                self.budget[iface] = budget - length
+            self.active.append(rg)
+            return rg
+
+    def release(self, rg):
+        with rg.lock:
+            unfinished = rg.start <= rg.end
+        with self.lock:
+            self.active.remove(rg)
+            if unfinished:
+                # Hand the leftover back so any worker picks it up first.
+                self.orphans.append(rg)
+
+    def complete(self):
+        with self.lock:
+            return self.cursor >= self.size and not self.orphans and not self.active
+
+    def count(self, iface, n):
+        with self.stats_lock:
+            self.stats[iface] += n
+
+
+def worker(job, iface, fd):
+    u = urllib.parse.urlsplit(job.url)
+    path = (u.path or "/") + (f"?{u.query}" if u.query else "")
+    conn = None
+    # Start small to probe the link, unless past runs already measured it.
+    rate = job.seed_rate.get(iface, MIN_CHUNK / TARGET_SECONDS)
+    fails = 0
+    throttles = 0
+    while fails < 3:
+        rg = job.take(iface, int(min(MAX_CHUNK, max(MIN_CHUNK, rate * TARGET_SECONDS))))
+        if rg is None:
+            break
+        if rg is CAPPED:
+            job.capped.add(iface)
+            break
+        if rg is WAIT:
+            time.sleep(0.2)
+            continue
+        t0 = time.time()
+        got = 0
+        try:
+            if conn is None:
+                conn = make_conn(job.url, iface)
+            conn.request("GET", path, headers={"Range": f"bytes={rg.start}-{rg.end}",
+                                               "User-Agent": UA})
+            r = conn.getresponse()
+            if r.status in (429, 503):
+                # The server is rate limiting us: stop adding connections,
+                # wait as told and try again without giving the link up.
+                job.throttled = True
+                r.read()
+                with threads_guard:
+                    # One refusal usually hits several workers at once:
+                    # retire a single connection per link, then wait and see.
+                    recent = time.time() - job.last_retire.get(iface, 0) < 3
+                    surplus = job.conns[iface] > 1 and not recent
+                    if surplus:
+                        job.conns[iface] -= 1
+                        job.last_retire[iface] = time.time()
+                    job.limit[iface] = job.conns[iface]
+                if surplus:
+                    # Too many connections for this server: retire this one.
+                    break
+                throttles += 1
+                if throttles > 10:
+                    raise IOError(f"HTTP {r.status}")
+                try:
+                    pause = float(r.getheader("Retry-After") or 0)
+                except ValueError:
+                    pause = 0
+                time.sleep(min(15, max(pause, throttles)))
+                continue
+            if r.status != 206:
+                raise IOError(f"HTTP {r.status}")
+            while True:
+                with rg.lock:
+                    if rg.start > rg.end:
+                        break
+                    n = min(BLOCK, rg.end - rg.start + 1)
+                data = r.read(n)
+                if not data:
+                    break
+                with rg.lock:
+                    keep = min(len(data), rg.end - rg.start + 1)
+                    os.pwrite(fd, data[:keep], rg.start)
+                    rg.start += keep
+                got += len(data)
+                job.count(iface, len(data))
+            if r.length:
+                # Response not fully read (the tail was stolen): the
+                # connection cannot be reused.
+                conn.close()
+                conn = None
+            fails = 0
+        except (OSError, http.client.HTTPException) as e:
+            job.errors[iface] = str(e) or type(e).__name__
+            fails += 1
+            if conn:
+                conn.close()
+            conn = None
+        finally:
+            job.release(rg)
+        dt = time.time() - t0
+        if got and dt > 0:
+            rate = 0.5 * rate + 0.5 * (got / dt)
+    else:
+        job.dead.add(iface)
+    if conn:
+        conn.close()
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Download one file over every internet link at once")
+    ap.add_argument("url")
+    ap.add_argument("-o", "--output")
+    ap.add_argument("-i", "--iface", action="append",
+                    help="link to use (repeatable); default: autodetect all")
+    ap.add_argument("-j", "--max-conns", type=int, default=6,
+                    help="upper bound of parallel connections per link (default 6)")
+    ap.add_argument("--cap", action="append", default=[], metavar="LINK=MB",
+                    help="data cap for a link in MB; LINK is an interface name, "
+                         "or 'usb' for every USB-tethered device (repeatable)")
+    ap.add_argument("--forget", action="store_true",
+                    help="ignore and overwrite what past runs learned")
+    ap.add_argument("--no-adb", action="store_true",
+                    help="do not switch on USB tethering on Android devices")
+    ap.add_argument("--no-dedupe", action="store_true",
+                    help="keep links even when they share a public IP")
+    args = ap.parse_args()
+
+    if args.iface:
+        ifaces = args.iface
+    else:
+        if not args.no_adb:
+            tether_android_devices()
+        ifaces = default_ifaces()
+        if not args.no_dedupe and len(ifaces) > 1:
+            ifaces = distinct_uplinks(ifaces)
+    if not ifaces:
+        sys.exit("error: no link with internet access")
+
+    budget = {}
+    for item in args.cap:
+        name, _, mb = item.partition("=")
+        try:
+            limit = int(float(mb) * 1e6)
+        except ValueError:
+            sys.exit(f"error: bad --cap value '{item}', expected LINK=MB")
+        matched = [i for i in ifaces if i == name or (name == "usb" and is_usb(i))]
+        if not matched:
+            log(f"--cap {item}: matches no link in use")
+        for i in matched:
+            budget[i] = limit
+
+    url, size, ranges = resolve(args.url, ifaces[0])
+    if not size or not ranges:
+        sys.exit("error: server does not accept byte ranges; use plain curl")
+    out_path = args.output or os.path.basename(urllib.parse.urlsplit(url).path) or "download.bin"
+
+    fd = os.open(out_path, os.O_RDWR | os.O_CREAT, 0o644)
+    os.ftruncate(fd, size)
+    job = Job(url, size, ifaces, budget)
+
+    # What past runs learned about this server through each link.
+    state = {"hosts": {}} if args.forget else load_state()
+    host = urllib.parse.urlsplit(url).hostname
+    keys = link_keys(ifaces)
+    known = state["hosts"].setdefault(host, {})
+    ceiling, start = {}, {}
+    for i in ifaces:
+        e = known.get(keys[i], {})
+        ceiling[i] = args.max_conns
+        if e.get("limit") and time.time() - e.get("t", 0) < LIMIT_TTL:
+            ceiling[i] = max(1, min(ceiling[i], e["limit"]))
+        start[i] = max(1, min(ceiling[i], e.get("best", START_CONNS)))
+        job.best[i] = start[i]
+        if e.get("rate"):
+            # Trust half of the remembered rate: links change between runs.
+            job.seed_rate[i] = e["rate"] / 2
+
+    threads = []
+    threads_lock = threads_guard
+
+    def spawn(iface):
+        t = threading.Thread(target=worker, args=(job, iface, fd), daemon=True)
+        with threads_lock:
+            threads.append(t)
+            job.conns[iface] += 1
+        t.start()
+
+    def grow(iface):
+        """Add connections to a link while each one still raises its rate."""
+        prev_rate, last, ticks = 0.0, 0, 0
+        while not job.finished.wait(GROW_INTERVAL):
+            if iface in job.dead or iface in job.capped or job.throttled:
+                return
+            now = job.stats[iface]
+            rate = (now - last) / GROW_INTERVAL
+            last = now
+            ticks += 1
+            if ticks == 1:
+                continue  # warm-up: connections are still ramping
+            if ticks > 2:
+                if rate <= prev_rate * GROW_GAIN:
+                    return  # the extra connection did not pay off
+                job.best[iface] = job.conns[iface]
+            if job.conns[iface] >= ceiling[iface]:
+                return
+            prev_rate = rate
+            spawn(iface)  # trial connection, judged on the next tick
+
+    t0 = time.time()
+    for i in ifaces:
+        for _ in range(start[i]):
+            spawn(i)
+    for i in ifaces:
+        threading.Thread(target=grow, args=(i,), daemon=True).start()
+
+    last_draw = 0.0
+    while not job.complete():
+        with threads_lock:
+            alive = any(t.is_alive() for t in threads)
+        if not alive:
+            break
+        time.sleep(0.1)
+        if time.time() - last_draw >= 0.5:
+            last_draw = time.time()
+            total = sum(job.stats.values())
+            conns = sum(job.conns.values())
+            sys.stderr.write(f"\r{100 * total / size:5.1f}%  "
+                             f"{total * 8 / max(last_draw - t0, 1e-3) / 1e6:6.1f} Mbps  "
+                             f"{conns} conns ")
+    dt = time.time() - t0
+    ok = job.complete()
+    job.finished.set()
+    sys.stderr.write("\r" + " " * 40 + "\r")
+    os.close(fd)
+
+    for i in ifaces:
+        if not job.stats[i]:
+            continue
+        e = known.setdefault(keys[i], {})
+        if i in job.limit:
+            e["limit"] = e["best"] = max(1, job.limit[i])
+            e["t"] = time.time()
+        else:
+            e["best"] = max(1, job.best[i])
+        per_conn = job.stats[i] / dt / max(job.conns[i], 1)
+        e["rate"] = round(0.5 * e.get("rate", per_conn) + 0.5 * per_conn)
+    save_state(state)
+
+    total = sum(job.stats.values()) or 1
+    if ok:
+        print(f"{out_path}: {size} bytes in {dt:.1f} s = {size * 8 / dt / 1e6:.1f} Mbps")
+    for i, b in sorted(job.stats.items(), key=lambda x: -x[1]):
+        notes = []
+        if i in job.capped:
+            notes.append("cap reached")
+        if i in job.errors:
+            notes.append(f"error: {job.errors[i]}")
+        note = f"  ({'; '.join(notes)})" if notes else ""
+        rtt = f", {LATENCY[i] * 1000:.0f} ms" if i in LATENCY else ""
+        print(f"  {i}: {b / 1e6:.1f} MB ({100 * b / total:.0f}%), "
+              f"{job.conns[i]} conns{rtt}{note}")
+    if not ok:
+        reason = "data caps reached" if job.capped else "every link failed"
+        sys.exit(f"error: download incomplete ({reason}); {out_path} is not usable")
+
+
+if __name__ == "__main__":
+    main()

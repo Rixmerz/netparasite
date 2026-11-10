@@ -1,0 +1,22 @@
+#!/bin/sh
+# Spread system traffic across every uplink with a default route.
+# Adds one ECMP default route (metric 50) on top of NetworkManager's own
+# per-device defaults, so NM keeps working and each new connection is hashed
+# onto one link (per-flow, so a single TCP stream never changes IP mid-way).
+case "$2" in up|down|dhcp4-change|connectivity-change) ;; *) exit 0 ;; esac
+
+hops=""
+n=0
+ip -4 route show default | grep '^default via' | while read -r _ _ gw _ dev _; do
+  echo "$gw $dev"
+done > /run/multipath-hops
+
+while read -r gw dev; do
+  [ -n "$gw" ] || continue
+  hops="$hops nexthop via $gw dev $dev weight 1"
+  n=$((n + 1))
+done < /run/multipath-hops
+
+ip -4 route del default metric 50 2>/dev/null
+[ "$n" -ge 2 ] && ip -4 route add default metric 50 $hops
+exit 0
