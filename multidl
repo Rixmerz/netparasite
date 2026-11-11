@@ -12,8 +12,8 @@ Design, aimed at using every link at full capacity:
   example a phone tethering the Wi-Fi this machine is already on); only
   one of them is kept.
 - Each worker keeps one persistent HTTP(S) connection bound to its
-  interface (Linux: SO_BINDTODEVICE, unprivileged since 5.7; Windows: bound to the
-  interface address).
+  interface (Linux: SO_BINDTODEVICE, unprivileged since 5.7; macOS:
+  IP_BOUND_IF, unprivileged; Windows: bound to the interface address).
 - Chunks are sized per worker from its measured rate (~3 s of work), so a
   fast link takes big bites and a slow link small ones.
 - Work stealing: once nothing is left to hand out, an idle worker takes
@@ -45,7 +45,7 @@ import time
 import urllib.parse
 
 BLOCK = 64 * 1024
-UA = "multidl/1.2"  # some servers drop requests that carry no user agent
+UA = "multidl/1.3"  # some servers drop requests that carry no user agent
 MIN_CHUNK = 256 * 1024
 MAX_CHUNK = 32 * 1024 * 1024
 TARGET_SECONDS = 3.0
@@ -55,6 +55,11 @@ GROW_GAIN = 1.15
 IP_ECHO_URL = "https://api.ipify.org/"
 START_CONNS = 2
 WINDOWS = os.name == "nt"
+MACOS = sys.platform == "darwin"
+# macOS: tunnels (VPNs, iCloud Private Relay) can hold a default route but are
+# not uplinks of their own.
+MAC_SKIP_PREFIXES = ("utun", "ipsec", "gif", "stf", "lo")
+IP_BOUND_IF = getattr(socket, "IP_BOUND_IF", 25)  # <netinet/in.h> on macOS
 if WINDOWS:
     _state_root = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
 else:
@@ -105,10 +110,57 @@ def _windows_links():
     return list(links)
 
 
+def _mac_default_routes():
+    """[(iface, gateway)] for every IPv4 default route, primary and scoped.
+    macOS keeps one primary default route plus a scoped one (flag I) per
+    extra service with a router; both show up in netstat."""
+    try:
+        out = subprocess.run(["netstat", "-rn", "-f", "inet"],
+                             capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    routes = []
+    for line in out.splitlines():
+        parts = line.split()
+        # Destination Gateway Flags Netif [Expire]
+        if len(parts) < 4 or parts[0] != "default":
+            continue
+        gw, flags, dev = parts[1], parts[2], parts[3]
+        if "G" not in flags or gw.startswith("link#"):
+            continue
+        if dev.startswith(MAC_SKIP_PREFIXES):
+            continue
+        routes.append((dev, gw))
+    return routes
+
+
+def _mac_hardware_ports():
+    """iface -> hardware port name, e.g. en7 -> 'iPhone USB'."""
+    try:
+        out = subprocess.run(["networksetup", "-listallhardwareports"],
+                             capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    ports, name = {}, None
+    for line in out.splitlines():
+        if line.startswith("Hardware Port:"):
+            name = line.split(":", 1)[1].strip()
+        elif line.startswith("Device:") and name is not None:
+            ports[line.split(":", 1)[1].strip()] = name
+            name = None
+    return ports
+
+
 def default_ifaces():
     """Every interface that currently holds a default route."""
     if WINDOWS:
         return _windows_links()
+    if MACOS:
+        ifaces = []
+        for dev, _ in _mac_default_routes():
+            if dev not in ifaces:
+                ifaces.append(dev)
+        return ifaces
     out = subprocess.run(["ip", "route", "show", "default"],
                          capture_output=True, text=True).stdout
     ifaces = []
@@ -126,6 +178,11 @@ def link_keys(ifaces):
     the same Wi-Fi card on another network counts as another link."""
     if WINDOWS:
         return {i: f"{i}@{WIN_LINKS.get(i, {}).get('gw', '-')}" for i in ifaces}
+    if MACOS:
+        gw = {}
+        for dev, via in _mac_default_routes():
+            gw.setdefault(dev, via)
+        return {i: f"{i}@{gw.get(i, '-')}" for i in ifaces}
     out = subprocess.run(["ip", "route", "show", "default"],
                          capture_output=True, text=True).stdout
     gw = {}
@@ -159,6 +216,9 @@ def save_state(state):
 def is_usb(iface):
     if WINDOWS:
         return WIN_LINKS.get(iface, {}).get("usb", False)
+    if MACOS:
+        port = _mac_hardware_ports().get(iface, "").lower()
+        return any(k in port for k in ("usb", "iphone", "rndis", "android", "ncm"))
     path = os.path.realpath(f"/sys/class/net/{iface}/device/subsystem")
     return os.path.basename(path) == "usb"
 
@@ -191,7 +251,8 @@ def tether_android_devices():
         if "rndis" in usb_state or "ncm" in usb_state:
             continue
         log(f"android {serial}: enabling USB tethering")
-        adb("-s", serial, "shell", "svc", "usb", "setFunctions", "rndis")
+        # macOS has no RNDIS driver; it speaks NCM natively (Android 11+).
+        adb("-s", serial, "shell", "svc", "usb", "setFunctions", "ncm" if MACOS else "rndis")
         switched += 1
     # The new interface needs a moment to appear and get a DHCP lease.
     deadline = time.time() + 15
@@ -222,6 +283,10 @@ def make_conn(url, iface, timeout=30):
             # Windows sends with the strong host model: a socket bound to an
             # interface's address leaves through that interface's route.
             sock.bind((WIN_LINKS[iface]["ip"], 0))
+        elif MACOS:
+            # Scope the socket to the interface: it uses that interface's
+            # (scoped) default route and source address.
+            sock.setsockopt(socket.IPPROTO_IP, IP_BOUND_IF, socket.if_nametoindex(iface))
         else:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, iface.encode())
         sock.settimeout(timeout)

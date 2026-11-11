@@ -16,7 +16,7 @@ connection always rides one link. So netparasite works at two levels:
 
 ## Requirements
 
-- `multidl`: Linux 5.7+ or Windows 10+, Python 3.9+, no extra packages
+- `multidl`: Linux 5.7+, macOS or Windows 10+, Python 3.9+, no extra packages
 - System-wide route: Linux only
 - NetworkManager, for the system-wide route
 - `adb` (android-tools), optional, to switch on USB tethering automatically
@@ -44,6 +44,28 @@ What it does by itself:
   `~/.local/state/multidl/state.json`; `--forget` starts from scratch.
 
 The server must support HTTP range requests.
+
+### macOS
+
+```sh
+install -m 755 multidl ~/.local/bin/multidl
+multidl https://example.com/big.iso
+```
+
+Links come from `netstat -rn -f inet`: the primary default route plus the
+scoped one (flag `I`) macOS keeps for every other service with a router, so a
+phone tethering over USB next to Wi-Fi shows up as a second link. Tunnels
+(`utun*`, `ipsec*`) are skipped: a VPN is not an uplink of its own. Each
+connection is scoped to its interface with `IP_BOUND_IF`, which needs no root.
+USB links are recognized by their hardware port name (`networksetup
+-listallhardwareports`, for example "iPhone USB"). Android tethering through adb
+asks for NCM, which macOS supports natively (Android 11+); RNDIS needs a
+third-party driver. There is no system-wide route on macOS.
+
+Traffic bound to a physical interface leaves outside any VPN. A corporate
+client that enforces its tunnel (Cloudflare WARP, Zscaler and similar) refuses
+those connections, and may block range downloads even through the tunnel; use
+`multidl` on a network you control.
 
 ### Windows
 
