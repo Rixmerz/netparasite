@@ -4,6 +4,20 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project uses [Semantic Versioning](https://semver.org/).
 
+## [1.4.0] - 2026-11-11
+
+### Added
+
+- `netparasite` command: `list`, `status`, `doctor`, `tether`, `get`, and
+  `netparasite LINK CMD` to run one command on one link through an
+  `LD_PRELOAD` shim that binds its sockets to that interface.
+
+### Fixed
+
+- Multipath route: links without internet (captive portal, no signal) are
+  left out, and the route is rebuilt only after NetworkManager has updated
+  the metrics following a connectivity change.
+
 ## [1.3.0] - 2026-11-11
 
 ### Added

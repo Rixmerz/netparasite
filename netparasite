@@ -1,0 +1,375 @@
+#!/usr/bin/env python3
+"""netparasite: see and use every internet link this machine has.
+
+  netparasite list                 links with a default route, by friendly name
+  netparasite status               list plus public IP, latency and the multipath route
+  netparasite doctor               find what keeps a link from adding bandwidth
+  netparasite tether               switch on USB tethering on every Android phone
+  netparasite get URL [opts]       download one file over every link (multidl)
+  netparasite LINK CMD [ARGS...]   run a command with all its traffic on one link
+                                   e.g. netparasite nubia_neo_3 git push
+
+LINK is a friendly name (Wi-Fi SSID, phone name), any unique prefix of it, or
+an interface name. Linux only, except `get`, which also runs on Windows/macOS.
+"""
+import importlib.machinery
+import importlib.util
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+PORTAL_METRIC = 20000  # NetworkManager adds this when a connectivity check fails
+ECMP_METRIC = "50"
+DISPATCHER = "/etc/NetworkManager/dispatcher.d/90-multipath-default"
+
+
+def load_multidl():
+    path = os.path.join(HERE, "multidl")
+    loader = importlib.machinery.SourceFileLoader("multidl", path)
+    spec = importlib.util.spec_from_loader("multidl", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def run(*cmd, timeout=10):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def slug(name):
+    return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+
+
+# ---------------------------------------------------------------- discovery
+
+def phones():
+    """serial -> {"name", "gateways"} for every authorized Android device."""
+    if not shutil.which("adb"):
+        return {}
+    found = {}
+    for line in run("adb", "devices").splitlines()[1:]:
+        parts = line.split()
+        if len(parts) < 2 or parts[1] != "device":
+            continue
+        serial = parts[0]
+        out = run("adb", "-s", serial, "shell",
+                  "settings get secure bluetooth_name; getprop ro.product.model; "
+                  "getprop sys.usb.state; ip -4 -o addr")
+        lines = out.splitlines()
+        name = next((l.strip() for l in lines[:2] if l.strip() and l.strip() != "null"), serial)
+        usb_state = lines[2] if len(lines) > 2 else ""
+        gws = set(re.findall(r"inet (\d+\.\d+\.\d+\.\d+)/", out))
+        found[serial] = {"name": name, "gateways": gws,
+                         "tethering": "rndis" in usb_state or "ncm" in usb_state}
+    return found
+
+
+def wifi_ssid(iface):
+    out = run("nmcli", "-t", "-f", "GENERAL.CONNECTION", "dev", "show", iface)
+    name = out.strip().partition(":")[2]
+    return name or None
+
+
+def links(with_phones=None):
+    """Every interface with a default route, as dicts, in route order."""
+    ph = phones() if with_phones is None else with_phones
+    out = run("ip", "-4", "route", "show", "default")
+    result, seen = [], set()
+    ecmp = []
+    for line in out.splitlines():
+        p = line.split()
+        if line.startswith("\tnexthop") or line.startswith(" nexthop") or p[:1] == ["nexthop"]:
+            ecmp.append(p[p.index("dev") + 1])
+            continue
+        if "dev" not in p or "via" not in p:
+            continue
+        dev = p[p.index("dev") + 1]
+        if dev in seen:
+            continue
+        seen.add(dev)
+        metric = int(p[p.index("metric") + 1]) if "metric" in p else 0
+        gw = p[p.index("via") + 1]
+        kind, name = "wired", None
+        if os.path.isdir(f"/sys/class/net/{dev}/wireless"):
+            kind, name = "wifi", wifi_ssid(dev)
+        elif os.path.basename(os.path.realpath(f"/sys/class/net/{dev}/device/subsystem")) == "usb":
+            kind = "usb"
+            for info in ph.values():
+                if gw in info["gateways"]:
+                    kind, name = "phone", info["name"]
+        result.append({"iface": dev, "gw": gw, "metric": metric, "kind": kind,
+                       "name": name or dev, "slug": slug(name or dev),
+                       "online": metric < PORTAL_METRIC})
+    for l in result:
+        l["in_ecmp"] = l["iface"] in ecmp
+    return result
+
+
+def find_link(query, ls):
+    q = slug(query)
+    exact = [l for l in ls if q in (l["slug"], l["iface"])]
+    if exact:
+        return exact[0]
+    pref = [l for l in ls if l["slug"].startswith(q) or l["iface"].startswith(query)]
+    if len(pref) == 1:
+        return pref[0]
+    names = ", ".join(l["slug"] for l in ls) or "none"
+    if pref:
+        sys.exit(f"netparasite: '{query}' matches several links: {', '.join(l['slug'] for l in pref)}")
+    sys.exit(f"netparasite: no link named '{query}' (links: {names})")
+
+
+def ecmp_installed():
+    return "metric " + ECMP_METRIC in run("ip", "-4", "route", "show", "default")
+
+
+# ------------------------------------------------------------------ commands
+
+def cmd_list(_args):
+    ls = links()
+    if not ls:
+        print("no links with a default route")
+        return
+    w = max(len(l["slug"]) for l in ls)
+    for l in ls:
+        state = "online" if l["online"] else "no internet (captive portal?)"
+        print(f"{l['slug']:<{w}}  {l['iface']:<12} {l['kind']:<6} {state}")
+
+
+def cmd_status(_args):
+    md = load_multidl()
+    ls = links()
+    probes = md.public_ips([l["iface"] for l in ls])
+    w = max([len(l["slug"]) for l in ls] + [4])
+    print(f"{'LINK':<{w}}  {'IFACE':<12} {'TYPE':<6} {'PUBLIC IP':<16} {'RTT':>7}  MULTIPATH")
+    for l in ls:
+        ip, rtt = probes.get(l["iface"], (None, None))
+        rtt_s = f"{rtt * 1000:.0f} ms" if rtt else "-"
+        mp = "yes" if l["in_ecmp"] else ("excluded" if not l["online"] else "no")
+        print(f"{l['slug']:<{w}}  {l['iface']:<12} {l['kind']:<6} {ip or 'no internet':<16} {rtt_s:>7}  {mp}")
+    if ecmp_installed():
+        n = sum(l["in_ecmp"] for l in ls)
+        print(f"\nmultipath route: active over {n} links")
+    elif os.path.exists(DISPATCHER):
+        if sum(l["online"] for l in ls) >= 2:
+            print(f"\nmultipath route: installed but not applied (sudo {DISPATCHER} x up)")
+        else:
+            print("\nmultipath route: installed, idle (needs 2+ links with internet)")
+    else:
+        print("\nmultipath route: not installed (sudo sh multipath/install.sh)")
+
+
+def cmd_doctor(_args):
+    md = load_multidl()
+    problems = 0
+
+    def bad(msg, fix=None):
+        nonlocal problems
+        problems += 1
+        print(f"[!] {msg}" + (f"\n    fix: {fix}" if fix else ""))
+
+    def good(msg):
+        print(f"[ok] {msg}")
+
+    rel = os.uname().release.split(".")
+    if (int(rel[0]), int(re.match(r"\d+", rel[1]).group())) >= (5, 7):
+        good(f"kernel {os.uname().release} binds sockets to a link without root")
+    else:
+        bad("kernel older than 5.7: binding to a link needs root")
+
+    ph = phones() if shutil.which("adb") else {}
+    if not shutil.which("adb"):
+        bad("adb not found: phones will not be tethered automatically",
+            "install android-tools (or Google's platform-tools)")
+    else:
+        for line in run("adb", "devices").splitlines()[1:]:
+            p = line.split()
+            if len(p) >= 2 and p[1] == "unauthorized":
+                bad(f"phone {p[0]} has not authorized USB debugging",
+                    "accept the prompt on the phone")
+        for serial, info in ph.items():
+            if info["tethering"]:
+                good(f"phone '{info['name']}' is tethering over USB")
+            else:
+                bad(f"phone '{info['name']}' is plugged in but not tethering",
+                    "netparasite tether")
+
+    ls = links(ph)
+    if not ls:
+        bad("no link has a default route")
+    phone_names = {slug(i["name"]) for i in ph.values()}
+    for l in ls:
+        if l["kind"] == "wifi" and l["slug"] in phone_names:
+            bad(f"Wi-Fi is joined to the hotspot of a phone that is also on USB "
+                f"('{l['name']}'): both links share one uplink",
+                "connect the Wi-Fi to another network")
+        if not l["online"]:
+            bad(f"link '{l['slug']}' has no internet (captive portal or no signal)",
+                "log in to the portal through that link: netparasite "
+                f"{l['slug']} xdg-open http://neverssl.com")
+
+    probes = md.public_ips([l["iface"] for l in ls])
+    by_ip = {}
+    for l in ls:
+        ip = probes.get(l["iface"], (None, None))[0]
+        if ip:
+            by_ip.setdefault(ip, []).append(l["slug"])
+    for ip, names in by_ip.items():
+        if len(names) > 1:
+            bad(f"links {', '.join(names)} leave through the same public IP {ip}: "
+                "they add no bandwidth")
+    online = [l for l in ls if probes.get(l["iface"], (None,))[0]]
+    if len(online) >= 2 and len(by_ip) >= 2:
+        good(f"{len(by_ip)} distinct uplinks with internet")
+
+    policy = run("sysctl", "-n", "net.ipv4.fib_multipath_hash_policy").strip()
+    if not os.path.exists(DISPATCHER):
+        bad("system-wide multipath route not installed: only `get` uses every link",
+            "sudo sh multipath/install.sh")
+    else:
+        if policy != "1":
+            bad(f"fib_multipath_hash_policy is {policy}: connections to one host all take one link",
+                "sudo sysctl -w net.ipv4.fib_multipath_hash_policy=1")
+        if len([l for l in ls if l["online"]]) >= 2 and not ecmp_installed():
+            bad("2+ links have internet but the multipath route is missing",
+                f"sudo {DISPATCHER} x up")
+        elif ecmp_installed():
+            good("multipath route active")
+
+    print(f"\n{problems} problem(s) found" if problems else "\nall good")
+    return 1 if problems else 0
+
+
+def cmd_tether(_args):
+    md = load_multidl()
+    md.tether_android_devices()
+    cmd_list(None)
+
+
+def cmd_get(args):
+    os.execv(sys.executable, [sys.executable, os.path.join(HERE, "multidl"), *args])
+
+
+# A tiny LD_PRELOAD shim: every IPv4/IPv6 socket that connects (or sends) to a
+# non-loopback address is first bound to NETPARASITE_IFACE. Loopback is left
+# alone so local DNS stubs (systemd-resolved) and local services keep working.
+SHIM_C = r"""
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <netinet/in.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+
+static void bind_iface(int fd, const struct sockaddr *sa) {
+    const char *dev = getenv("NETPARASITE_IFACE");
+    if (!dev || !sa) return;
+    if (sa->sa_family == AF_INET) {
+        const struct sockaddr_in *in = (const void *)sa;
+        if ((ntohl(in->sin_addr.s_addr) >> 24) == 127) return;
+    } else if (sa->sa_family == AF_INET6) {
+        const struct sockaddr_in6 *in6 = (const void *)sa;
+        if (IN6_IS_ADDR_LOOPBACK(&in6->sin6_addr)) return;
+        if (IN6_IS_ADDR_V4MAPPED(&in6->sin6_addr) && in6->sin6_addr.s6_addr[12] == 127) return;
+    } else {
+        return;
+    }
+    setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, dev, strlen(dev));
+}
+
+int connect(int fd, const struct sockaddr *sa, socklen_t len) {
+    static int (*real)(int, const struct sockaddr *, socklen_t);
+    if (!real) real = dlsym(RTLD_NEXT, "connect");
+    bind_iface(fd, sa);
+    return real(fd, sa, len);
+}
+
+ssize_t sendto(int fd, const void *buf, size_t n, int flags,
+               const struct sockaddr *sa, socklen_t len) {
+    static ssize_t (*real)(int, const void *, size_t, int, const struct sockaddr *, socklen_t);
+    if (!real) real = dlsym(RTLD_NEXT, "sendto");
+    bind_iface(fd, sa);
+    return real(fd, buf, n, flags, sa, len);
+}
+"""
+
+
+def shim_path():
+    cache = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
+                         "netparasite")
+    so = os.path.join(cache, "bind.so")
+    src = os.path.join(cache, "bind.c")
+    if os.path.exists(so) and os.path.exists(src) and open(src).read() == SHIM_C:
+        return so
+    cc = shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
+    if not cc:
+        sys.exit("netparasite: a C compiler (cc) is needed once to build the link shim")
+    os.makedirs(cache, exist_ok=True)
+    with open(src, "w") as f:
+        f.write(SHIM_C)
+    r = subprocess.run([cc, "-shared", "-fPIC", "-O2", "-o", so, src, "-ldl"],
+                       capture_output=True, text=True)
+    if r.returncode:
+        sys.exit("netparasite: building the shim failed:\n" + r.stderr)
+    return so
+
+
+def cmd_on_link(query, argv):
+    if not argv:
+        sys.exit(f"usage: netparasite {query} COMMAND [ARGS...]")
+    link = find_link(query, links())
+    if not link["online"]:
+        print(f"netparasite: warning: '{link['slug']}' has no internet right now",
+              file=sys.stderr)
+    env = dict(os.environ)
+    env["NETPARASITE_IFACE"] = link["iface"]
+    pre = env.get("LD_PRELOAD")
+    env["LD_PRELOAD"] = shim_path() + (" " + pre if pre else "")
+    exe = shutil.which(argv[0])
+    if exe and _is_static_or_go(exe):
+        print(f"netparasite: warning: {argv[0]} does not load the shim (static or Go "
+              "binary); its traffic may use any link", file=sys.stderr)
+    try:
+        os.execvpe(argv[0], argv, env)
+    except FileNotFoundError:
+        sys.exit(f"netparasite: command not found: {argv[0]}")
+
+
+def _is_static_or_go(path):
+    out = run("file", "-L", path)
+    if "statically linked" in out:
+        return True
+    try:
+        with open(path, "rb") as f:
+            return b"Go build ID" in f.read(1 << 20)
+    except OSError:
+        return False
+
+
+COMMANDS = {"list": cmd_list, "ls": cmd_list, "status": cmd_status,
+            "doctor": cmd_doctor, "tether": cmd_tether}
+
+
+def main():
+    argv = sys.argv[1:]
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    if argv[0] == "get":
+        return cmd_get(argv[1:])
+    if not sys.platform.startswith("linux"):
+        sys.exit("netparasite: only `get` is supported on this platform")
+    if argv[0] in COMMANDS:
+        return COMMANDS[argv[0]](argv[1:]) or 0
+    return cmd_on_link(argv[0], argv[1:])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

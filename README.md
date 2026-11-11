@@ -14,6 +14,30 @@ connection always rides one link. So netparasite works at two levels:
 | `multidl` | Downloads one file over every link at once with parallel HTTP range requests | One big download gets the sum of all links |
 | `multipath/` | ECMP default route: each new connection of the whole system goes out a different link | Browsers, updates, anything with many connections |
 
+## The `netparasite` command
+
+```sh
+netparasite list                    # links by friendly name
+netparasite status                  # plus public IP, latency, multipath state
+netparasite doctor                  # what keeps a link from adding bandwidth
+netparasite tether                  # switch on USB tethering on every phone
+netparasite get URL                 # same as multidl URL
+netparasite nubia_neo_3 git push    # run one command on one link
+```
+
+Links are named after the Wi-Fi SSID or the phone's name; any unique prefix
+works, and so does the interface name. `netparasite LINK CMD` builds a small
+`LD_PRELOAD` shim once (needs `cc`) that binds every outgoing socket of the
+command to that interface; loopback is left alone so local DNS keeps working.
+Static and Go binaries (for example `gh`, `docker`) ignore the shim, and the
+command warns when it sees one. Linux only; `get` also runs on Windows and
+macOS.
+
+`doctor` checks, among others: phones plugged in but not tethering, USB
+debugging not authorized, links behind a captive portal, links sharing one
+public IP, the laptop's Wi-Fi joined to the hotspot of a phone that is also on
+USB, and a missing or misconfigured multipath route.
+
 ## Requirements
 
 - `multidl`: Linux 5.7+, macOS or Windows 10+, Python 3.9+, no extra packages
@@ -24,7 +48,7 @@ connection always rides one link. So netparasite works at two levels:
 ## multidl
 
 ```sh
-install -m 755 multidl ~/.local/bin/multidl
+ln -s "$PWD/netparasite" "$PWD/multidl" ~/.local/bin/
 multidl https://example.com/big.iso
 multidl https://example.com/big.iso --cap usb=500   # stop after 500 MB on USB links
 multidl https://example.com/big.iso -i wlan0 -i usb0 # pick links by hand
@@ -48,7 +72,7 @@ The server must support HTTP range requests.
 ### macOS
 
 ```sh
-install -m 755 multidl ~/.local/bin/multidl
+ln -s "$PWD/netparasite" "$PWD/multidl" ~/.local/bin/
 multidl https://example.com/big.iso
 ```
 
