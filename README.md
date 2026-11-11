@@ -23,7 +23,18 @@ netparasite doctor                  # what keeps a link from adding bandwidth
 netparasite tether                  # switch on USB tethering on every phone
 netparasite get URL                 # same as multidl URL
 netparasite nubia_neo_3 git push    # run one command on one link
+netparasite pin github.com nubia    # always reach github.com through the phone
+netparasite pin                     # list pins
+netparasite unpin github.com
 ```
+
+A pin is remembered across reboots and replugs: phones are identified by
+their USB serial and Wi-Fi networks by their NetworkManager connection name.
+Whenever the link is up and online, the destination's addresses get a host
+route through it, for every program on the machine (Go binaries included).
+When the link is missing or offline, the destination follows the normal
+routes. Hostnames are re-resolved every 10 minutes and on every link change.
+Pins need the system-wide part installed (`multipath/install.sh`).
 
 Links are named after the Wi-Fi SSID or the phone's name; any unique prefix
 works, and so does the interface name. `netparasite LINK CMD` builds a small

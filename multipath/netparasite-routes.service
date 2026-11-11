@@ -1,0 +1,6 @@
+[Unit]
+Description=netparasite: apply pinned routes
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/netparasite/netparasite-routes

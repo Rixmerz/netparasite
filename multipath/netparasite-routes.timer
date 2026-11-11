@@ -1,0 +1,9 @@
+[Unit]
+Description=netparasite: re-resolve pinned hostnames
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target

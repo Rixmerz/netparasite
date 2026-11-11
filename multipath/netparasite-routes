@@ -1,0 +1,51 @@
+#!/bin/sh
+# Apply the pinned routes in /etc/netparasite/routes. Run as root; called by
+# NetworkManager on every link change and by a timer that re-resolves names.
+#
+# Each line:  DESTINATION  LINK  [# comment]
+#   DESTINATION  hostname, IPv4 address or IPv4 CIDR
+#   LINK         usb:SERIAL (a phone, by its USB serial), conn:NAME (a
+#                NetworkManager connection, e.g. a Wi-Fi network) or dev:IFACE
+# When the link is missing or has no internet the rule is skipped and the
+# destination follows the normal routes.
+RULES=${NETPARASITE_RULES:-/etc/netparasite/routes}
+PROTO=222  # tag on every route this script owns, so it can flush them
+
+# Called as a dispatcher script ($1 iface, $2 action) or by hand/timer (no args).
+case "$2" in ""|up|down|dhcp4-change|connectivity-change) ;; *) exit 0 ;; esac
+[ "$2" = connectivity-change ] && sleep 3
+
+ip -4 route flush proto $PROTO 2>/dev/null
+[ -r "$RULES" ] || exit 0
+
+link_dev() {
+  case "$1" in
+    usb:*)
+      for d in /sys/class/net/*; do
+        [ "$(cat "$d/device/../serial" 2>/dev/null)" = "${1#usb:}" ] && { echo "${d##*/}"; return; }
+      done ;;
+    conn:*)
+      for d in $(nmcli -g DEVICE dev); do
+        [ "$(nmcli -g GENERAL.CONNECTION dev show "$d" 2>/dev/null)" = "${1#conn:}" ] && { echo "$d"; return; }
+      done ;;
+    dev:*) echo "${1#dev:}" ;;
+  esac
+}
+
+sed 's/#.*//' "$RULES" | while read -r dest link; do
+  [ -n "$dest" ] && [ -n "$link" ] || continue
+  dev=$(link_dev "$link")
+  [ -n "$dev" ] || continue
+  route=$(ip -4 route show default dev "$dev" | grep -m1 "^default via")
+  gw=$(echo "$route" | sed -n 's/.*via \([0-9.]*\).*/\1/p')
+  metric=$(echo "$route" | sed -n 's/.*metric \([0-9]*\).*/\1/p')
+  [ -n "$gw" ] && [ "${metric:-0}" -lt 20000 ] || continue
+  case "$dest" in
+    *[!0-9./]*) addrs=$(getent ahostsv4 "$dest" | awk '{print $1}' | sort -u) ;;
+    *) addrs=$dest ;;
+  esac
+  for a in $addrs; do
+    ip -4 route replace "$a" via "$gw" dev "$dev" proto $PROTO metric 5
+  done
+done
+exit 0

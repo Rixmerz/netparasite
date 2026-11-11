@@ -6,6 +6,9 @@
   netparasite doctor               find what keeps a link from adding bandwidth
   netparasite tether               switch on USB tethering on every Android phone
   netparasite get URL [opts]       download one file over every link (multidl)
+  netparasite pin [DEST LINK]      always reach DEST (host, IP or CIDR) through LINK
+                                   when LINK is up; no args lists the pins
+  netparasite unpin DEST           remove a pin
   netparasite LINK CMD [ARGS...]   run a command with all its traffic on one link
                                    e.g. netparasite nubia_neo_3 git push
 
@@ -353,7 +356,73 @@ def _is_static_or_go(path):
         return False
 
 
-COMMANDS = {"list": cmd_list, "ls": cmd_list, "status": cmd_status,
+RULES = "/etc/netparasite/routes"
+
+
+def link_key(l):
+    """A name for the link that survives reboots and replugging."""
+    if l["kind"] in ("phone", "usb"):
+        try:
+            with open(f"/sys/class/net/{l['iface']}/device/../serial") as f:
+                return "usb:" + f.read().strip()
+        except OSError:
+            pass
+    if l["kind"] == "wifi" and l["name"] != l["iface"]:
+        return "conn:" + l["name"]
+    return "dev:" + l["iface"]
+
+
+def read_rules():
+    try:
+        with open(RULES) as f:
+            return f.read().splitlines()
+    except OSError:
+        return None
+
+
+def cmd_pin(args):
+    lines = read_rules()
+    if lines is None:
+        sys.exit(f"netparasite: {RULES} is missing; run: sudo sh multipath/install.sh")
+    if not args:
+        rules = [l for l in lines if l.split("#")[0].strip()]
+        if not rules:
+            print("no pins")
+        ls = links()
+        for r in rules:
+            dest, key = r.split("#")[0].split()[:2]
+            label = r.partition("#")[2].strip() or key
+            up = any(link_key(l) == key and l["online"] for l in ls)
+            print(f"{dest:<24} -> {label:<20} {'active' if up else 'link down: normal routes'}")
+        return
+    if len(args) != 2:
+        sys.exit("usage: netparasite pin DEST LINK")
+    dest, query = args
+    link = find_link(query, links())
+    key = link_key(link)
+    lines = [l for l in lines if l.split("#")[0].split()[:1] != [dest]]
+    lines.append(f"{dest} {key} # {link['slug']}")
+    try:
+        with open(RULES, "w") as f:
+            f.write("\n".join(lines) + "\n")
+    except OSError as e:
+        sys.exit(f"netparasite: cannot write {RULES}: {e}")
+    print(f"{dest} now goes through {link['slug']} whenever it is up")
+
+
+def cmd_unpin(args):
+    if len(args) != 1:
+        sys.exit("usage: netparasite unpin DEST")
+    lines = read_rules() or []
+    keep = [l for l in lines if l.split("#")[0].split()[:1] != [args[0]]]
+    if len(keep) == len(lines):
+        sys.exit(f"netparasite: no pin for {args[0]}")
+    with open(RULES, "w") as f:
+        f.write("\n".join(keep) + "\n")
+    print(f"{args[0]} follows the normal routes again")
+
+
+COMMANDS = {"pin": cmd_pin, "unpin": cmd_unpin, "list": cmd_list, "ls": cmd_list, "status": cmd_status,
             "doctor": cmd_doctor, "tether": cmd_tether}
 
 

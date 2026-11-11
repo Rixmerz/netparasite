@@ -1,0 +1,8 @@
+[Unit]
+Description=netparasite: re-apply pinned routes when the rules change
+
+[Path]
+PathChanged=/etc/netparasite/routes
+
+[Install]
+WantedBy=multi-user.target

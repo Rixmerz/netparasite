@@ -11,6 +11,9 @@ and the project uses [Semantic Versioning](https://semver.org/).
 - `netparasite` command: `list`, `status`, `doctor`, `tether`, `get`, and
   `netparasite LINK CMD` to run one command on one link through an
   `LD_PRELOAD` shim that binds its sockets to that interface.
+- `netparasite pin DEST LINK` / `unpin`: persistent per-destination routes,
+  applied by a NetworkManager dispatcher hook and a systemd path unit and
+  timer, active only while the link is online.
 
 ### Fixed
 
