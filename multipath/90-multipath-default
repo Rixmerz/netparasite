@@ -7,8 +7,15 @@ case "$2" in up|down|dhcp4-change|connectivity-change) ;; *) exit 0 ;; esac
 
 hops=""
 n=0
-ip -4 route show default | grep '^default via' | while read -r _ _ gw _ dev _; do
-  echo "$gw $dev"
+# NetworkManager adds 20000 to the metric of a link whose connectivity check
+# fails (no internet, or a captive portal still waiting for a login). Leave
+# those out, so half the connections do not die and the portal stays reachable
+# through its own link; the dispatcher reruns on connectivity-change.
+ip -4 route show default | grep '^default via' | while read -r line; do
+  set -- $line
+  metric=$(echo "$line" | sed -n 's/.* metric \([0-9]*\).*/\1/p')
+  [ "${metric:-0}" -ge 20000 ] && continue
+  echo "$3 $5"
 done > /run/multipath-hops
 
 while read -r gw dev; do
