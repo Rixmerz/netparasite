@@ -4,6 +4,9 @@
 # per-device defaults, so NM keeps working and each new connection is hashed
 # onto one link (per-flow, so a single TCP stream never changes IP mid-way).
 case "$2" in up|down|dhcp4-change|connectivity-change) ;; *) exit 0 ;; esac
+# NetworkManager rewrites the route metric a moment after it reports a
+# connectivity change; read the routes only once that has settled.
+[ "$2" = connectivity-change ] && sleep 3
 
 hops=""
 n=0
